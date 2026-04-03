@@ -1,0 +1,27 @@
+{
+  "name": "emdash-plugin-deploy-hook",
+  "version": "1.0.0",
+  "description": "Static site generation + deploy hook for EmDash CMS. Auto-prerenders public pages and triggers rebuilds from the admin panel.",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./sandbox": "./src/sandbox-entry.ts",
+    "./integration": "./src/integration.ts"
+  },
+  "files": ["src"],
+  "keywords": [
+    "emdash",
+    "cms",
+    "plugin",
+    "static",
+    "deploy",
+    "prerender",
+    "cloudflare"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "astro": ">=5.0.0",
+    "emdash": ">=0.0.3"
+  }
+}
