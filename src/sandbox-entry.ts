@@ -91,23 +91,20 @@ async function buildAdminPage(ctx: PluginContext) {
 	blocks.push({ type: "fields", fields });
 
 	// Build button
-	blocks.push({
-		type: "actions",
-		elements: [
-			{
-				type: "button",
-				text: "Build & Deploy",
-				action_id: "trigger_build",
-				style: "primary",
-				confirm: {
-					title: "Build & Deploy?",
-					text: "This will rebuild your site with the latest content from the database. It may take a minute.",
-					confirm: "Build",
-					deny: "Cancel",
+	blocks.push(
+		{ type: "context", text: "Rebuild your site with the latest content from the database." },
+		{
+			type: "actions",
+			elements: [
+				{
+					type: "button",
+					label: "Build & Deploy",
+					action_id: "trigger_build",
+					style: "primary",
 				},
-			},
-		],
-	});
+			],
+		},
+	);
 
 	// Settings form at bottom
 	blocks.push(
