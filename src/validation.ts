@@ -1,9 +1,9 @@
 // shared validation and sanitization utilities
 
 export const FETCH_TIMEOUT_MS = 30_000;
-export const ALLOWED_URL_PROTOCOLS = ["https:"];
+export const ALLOWED_URL_PROTOCOLS = ["https:"] as const;
 export const MAX_URL_LENGTH = 2048;
-
+export const BUILD_DEBOUNCE_MS = 60_000;
 
 // validates a deploy hook URL.
 // must be https, well-formed and within length limits
@@ -16,7 +16,7 @@ export function validateUrl(url: string): { valid: boolean; error?: string } {
 	}
 	try {
 		const parsed = new URL(url);
-		if (!ALLOWED_URL_PROTOCOLS.includes(parsed.protocol)) {
+		if (!ALLOWED_URL_PROTOCOLS.includes(parsed.protocol as typeof ALLOWED_URL_PROTOCOLS[number])) {
 			return { valid: false, error: "Only HTTPS URLs are allowed" };
 		}
 		return { valid: true };
@@ -25,7 +25,7 @@ export function validateUrl(url: string): { valid: boolean; error?: string } {
 	}
 }
 
-//sanitizes a name (collection/taxonomy) to only allow safe characters
+// sanitizes a name (collection/taxonomy) to only allow safe characters
 export function sanitizeName(name: string): string {
 	return name.replace(/[^a-zA-Z0-9_-]/g, "");
 }

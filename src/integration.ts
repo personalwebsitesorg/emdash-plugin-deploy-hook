@@ -2,16 +2,18 @@
  * Astro Integration — Static site generation for EmDash
  *
  * Everything is automatic:
- * 1. astro:build:start — syncs production D1 to local SQLite (reads wrangler.jsonc)
+ * 1. astro:build:start — syncs production D1 to local SQLite (reads wrangler config)
  * 2. astro:route:setup — sets prerender=true on public pages
  * 3. astro:config:setup — Vite plugin injects getStaticPaths() into [slug] pages
  *
- * Auth: reads CF_D1_TOKEN env var. Falls back to wrangler CLI if not set.
+ * Auth: reads CF_D1_TOKEN env var for fast API mode. Falls back to wrangler CLI.
  */
 
-import type { AstroIntegration } from "astro";
-import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import type { AstroIntegration, AstroIntegrationLogger } from "astro";
+import { execFileSync, execSync } from "node:child_process";
+import { readFileSync, writeFileSync, existsSync, mkdtempSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { sanitizeName } from "./validation.js";
 
 interface DeployHookOptions {
@@ -30,8 +32,15 @@ const RENDER_TABLES = new Set([
 	"taxonomies", "content_taxonomies", "media", "revisions", "users",
 ]);
 
-function isRenderTable(name: string) {
+// Only allow safe characters in identifiers
+const SAFE_IDENTIFIER = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+
+function isRenderTable(name: string): boolean {
 	return name.startsWith("ec_") || RENDER_TABLES.has(name);
+}
+
+function isSafeIdentifier(name: string): boolean {
+	return SAFE_IDENTIFIER.test(name) && name.length <= 128;
 }
 
 export function deployHook(options: DeployHookOptions = {}): AstroIntegration {
@@ -59,79 +68,184 @@ export function deployHook(options: DeployHookOptions = {}): AstroIntegration {
 	};
 }
 
-// ── D1 Sync ──
+// ── Wrangler Config Reader ──
 
-async function syncD1(logger: any) {
-	// Read wrangler.jsonc
-	let accountId: string, dbId: string, dbName: string;
-	try {
-		const raw = readFileSync("wrangler.jsonc", "utf8");
-		const clean = raw.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "").replace(/,\s*([}\]])/g, "$1");
-		const cfg = JSON.parse(clean);
-		accountId = cfg.account_id;
-		const db = cfg.d1_databases?.[0];
-		if (!accountId || !db) throw new Error("missing");
-		dbId = db.database_id;
-		dbName = db.database_name;
-	} catch {
-		logger.warn("No D1 config in wrangler.jsonc — skipping sync");
-		return;
+interface WranglerD1Config {
+	accountId: string;
+	dbId: string;
+	dbName: string;
+}
+
+function readWranglerConfig(logger: AstroIntegrationLogger): WranglerD1Config | null {
+	const candidates = ["wrangler.jsonc", "wrangler.json"];
+	let raw: string | null = null;
+
+	for (const file of candidates) {
+		if (existsSync(file)) {
+			raw = readFileSync(file, "utf8");
+			break;
+		}
 	}
 
+	if (!raw) {
+		logger.warn("No wrangler.jsonc or wrangler.json found — skipping D1 sync");
+		return null;
+	}
+
+	try {
+		const clean = raw
+			.replace(/\/\/.*$/gm, "")
+			.replace(/\/\*[\s\S]*?\*\//g, "")
+			.replace(/,\s*([}\]])/g, "$1");
+		const cfg = JSON.parse(clean);
+		const accountId = cfg.account_id;
+		const db = cfg.d1_databases?.[0];
+
+		if (!accountId || !db?.database_id || !db?.database_name) {
+			logger.warn("Missing account_id or D1 database config in wrangler config");
+			return null;
+		}
+
+		if (!isSafeIdentifier(db.database_name)) {
+			logger.error(`Unsafe database name: ${db.database_name}`);
+			return null;
+		}
+
+		return { accountId, dbId: db.database_id, dbName: db.database_name };
+	} catch (err) {
+		logger.warn(`Failed to parse wrangler config: ${err instanceof Error ? err.message : err}`);
+		return null;
+	}
+}
+
+// ── D1 Sync ──
+
+async function syncD1(logger: AstroIntegrationLogger) {
+	const config = readWranglerConfig(logger);
+	if (!config) return;
+
+	const { accountId, dbId, dbName } = config;
 	const token = process.env.CF_D1_TOKEN || process.env.CLOUDFLARE_API_TOKEN || "";
 	const useApi = !!token;
+	const tmpDir = mkdtempSync(join(tmpdir(), "emdash-d1-"));
+
 	logger.info(useApi ? "Syncing D1 via API" : "Syncing D1 via wrangler CLI (set CF_D1_TOKEN for faster builds)");
 	const t0 = Date.now();
 
-	// Query helpers
-	async function apiQuery(sql: string) {
+	// ── Query helpers ──
+
+	async function apiQuery(sql: string): Promise<any[]> {
 		const res = await fetch(
 			`https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${dbId}/query`,
-			{ method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ sql }) },
+			{
+				method: "POST",
+				headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+				body: JSON.stringify({ sql }),
+			},
 		);
 		const json = await res.json() as any;
-		if (!json.success) throw new Error(json.errors?.[0]?.message || "D1 API error");
+		if (!json.success) {
+			throw new Error(json.errors?.[0]?.message || `D1 API error (HTTP ${res.status})`);
+		}
 		return json.result?.[0]?.results || [];
 	}
 
-	function cliQuery(sql: string) {
+	function cliQuery(sql: string): any[] {
+		const sqlFile = join(tmpDir, "query.sql");
+		writeFileSync(sqlFile, sql);
 		try {
-			const out = execSync(
-				`npx wrangler d1 execute "${dbName}" --remote --json --command "${sql.replace(/"/g, '\\"')}"`,
-				{ maxBuffer: 50 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] },
-			);
+			const out = execFileSync("npx", [
+				"wrangler", "d1", "execute", dbName,
+				"--remote", "--json", "--file", sqlFile,
+			], { maxBuffer: 50 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] });
 			return JSON.parse(out.toString())[0]?.results || [];
-		} catch { return []; }
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			logger.error(`wrangler query failed: ${msg}`);
+			return [];
+		}
 	}
 
-	const query: (sql: string) => Promise<any[]> = useApi
-		? apiQuery
-		: async (sql) => cliQuery(sql);
+	function localExec(filePath: string): void {
+		execFileSync("npx", [
+			"wrangler", "d1", "execute", dbName,
+			"--local", "--file", filePath,
+		], { stdio: "pipe" });
+	}
 
-	// 1. Get schemas
-	const allTables = await query(
-		"SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE '%fts%' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'",
-	);
-	const tables = allTables.filter((t: any) => t.sql && isRenderTable(t.name));
+	const query = useApi ? apiQuery : async (sql: string) => cliQuery(sql);
+
+	// ── 1. Get schemas ──
+
+	let allTables: any[];
+	try {
+		allTables = await query(
+			"SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE '%fts%' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'",
+		);
+	} catch (err) {
+		logger.error(`Failed to fetch table list: ${err instanceof Error ? err.message : err}`);
+		logger.error("D1 sync failed — site will deploy without prerendered content");
+		return;
+	}
+
+	const tables = allTables.filter((t: any) => t.sql && isRenderTable(t.name) && isSafeIdentifier(t.name));
 	logger.info(`${tables.length} tables (${allTables.length - tables.length} skipped)`);
 
-	// 2. Create schemas locally
-	const schema = tables.map((t: any) => t.sql.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS") + ";").join("\n");
-	writeFileSync("/tmp/d1_schema.sql", schema);
-	try { execSync(`npx wrangler d1 execute "${dbName}" --local --file=/tmp/d1_schema.sql`, { stdio: "pipe" }); } catch {}
+	if (tables.length === 0) {
+		logger.warn("No render tables found — content pages will be empty");
+		return;
+	}
 
-	// 3. Fetch data — parallel with API, sequential with CLI
-	const results: Array<{ name: string; rows: any[] }> = useApi
-		? await Promise.all(tables.map(async (t: any) => ({ name: t.name, rows: await apiQuery(`SELECT * FROM "${t.name}"`) })))
-		: await Promise.all(tables.map(async (t: any) => ({ name: t.name, rows: await query(`SELECT * FROM "${t.name}"`) })));
+	// ── 2. Create schemas locally ──
 
-	// 4. One big INSERT
+	const schema = tables
+		.map((t: any) => t.sql.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS") + ";")
+		.join("\n");
+	const schemaFile = join(tmpDir, "schema.sql");
+	writeFileSync(schemaFile, schema);
+
+	try {
+		localExec(schemaFile);
+	} catch (err) {
+		logger.error(`Failed to create local schemas: ${err instanceof Error ? err.message : err}`);
+		return;
+	}
+
+	// ── 3. Fetch data ──
+
+	let results: Array<{ name: string; rows: any[] }>;
+
+	try {
+		if (useApi) {
+			results = await Promise.all(
+				tables.map(async (t: any) => ({
+					name: t.name,
+					rows: await apiQuery(`SELECT * FROM "${t.name}"`),
+				})),
+			);
+		} else {
+			results = [];
+			for (const t of tables) {
+				const rows = cliQuery(`SELECT * FROM "${t.name}"`);
+				results.push({ name: t.name, rows });
+			}
+		}
+	} catch (err) {
+		logger.error(`Failed to fetch data: ${err instanceof Error ? err.message : err}`);
+		logger.error("D1 sync failed — site will deploy without prerendered content");
+		return;
+	}
+
+	// ── 4. Build + execute one INSERT file ──
+
 	let allSQL = "";
 	let total = 0;
+
 	for (const { name, rows } of results) {
 		if (!rows.length) continue;
 		const cols = Object.keys(rows[0]);
 		const colList = cols.map((c) => `"${c}"`).join(",");
+
 		for (const r of rows) {
 			const vals = cols.map((c) => {
 				const v = r[c];
@@ -146,8 +260,15 @@ async function syncD1(logger: any) {
 	}
 
 	if (allSQL) {
-		writeFileSync("/tmp/d1_all.sql", allSQL);
-		execSync(`npx wrangler d1 execute "${dbName}" --local --file=/tmp/d1_all.sql`, { stdio: "pipe" });
+		const dataFile = join(tmpDir, "data.sql");
+		writeFileSync(dataFile, allSQL);
+		try {
+			localExec(dataFile);
+		} catch (err) {
+			logger.error(`Failed to insert data locally: ${err instanceof Error ? err.message : err}`);
+			logger.error("D1 sync failed — site will deploy without prerendered content");
+			return;
+		}
 	}
 
 	logger.info(`Synced ${total} rows in ${((Date.now() - t0) / 1000).toFixed(1)}s`);

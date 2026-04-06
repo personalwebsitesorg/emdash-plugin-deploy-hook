@@ -7,7 +7,7 @@
 
 import { definePlugin } from "emdash";
 import type { PluginContext } from "emdash";
-import { validateUrl, FETCH_TIMEOUT_MS } from "./validation.js";
+import { validateUrl, FETCH_TIMEOUT_MS, BUILD_DEBOUNCE_MS } from "./validation.js";
 
 // types
 
@@ -53,6 +53,16 @@ async function triggerBuild(
 ): Promise<{ success: boolean; error?: string }> {
 	if (!hookUrl) return { success: false, error: "No deploy hook URL configured" };
 	if (!ctx.http) return { success: false, error: "Network access not available" };
+
+	// Debounce: reject if last build was less than 60s ago
+	const lastBuild = await ctx.kv.get<string>("state:lastBuild");
+	if (lastBuild) {
+		const elapsed = Date.now() - new Date(lastBuild).getTime();
+		if (elapsed < BUILD_DEBOUNCE_MS) {
+			const wait = Math.ceil((BUILD_DEBOUNCE_MS - elapsed) / 1000);
+			return { success: false, error: `Please wait ${wait}s before triggering another build` };
+		}
+	}
 
 	const validation = validateUrl(hookUrl);
 	if (!validation.valid) {
